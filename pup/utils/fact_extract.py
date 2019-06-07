@@ -1,6 +1,9 @@
 import logging
-import os
+from tempfile import NamedTemporaryFile
 
+from . import mnm, configuration
+
+from insights.core import dr
 from insights import extract, rule, make_metadata, run
 
 from insights.combiners.cloud_provider import CloudProvider
@@ -23,6 +26,7 @@ from insights.specs import Specs
 from insights.util.canonical_facts import get_canonical_facts
 
 logger = logging.getLogger('advisor-pup')
+dr.log.setLevel(configuration.FACT_EXTRACT_LOGLEVEL)
 
 SATELLITE_MANAGED_FILES = {
     "sat5": ["/etc/sysconfig/rhn", "systemid"],
@@ -32,10 +36,10 @@ SATELLITE_MANAGED_FILES = {
 
 @rule(optional=[Specs.hostname, CpuInfo, VirtWhat, MemInfo, IpAddr, DMIDecode,
                 RedHatRelease, Uname, LsMod, InstalledRpms, UnitFiles, PsAuxcww,
-                DateUTC, Uptime, YumReposD, LsEtc, CloudProvider])
+                DateUTC, Uptime, YumReposD, LsEtc, CloudProvider, Specs.display_name])
 def system_profile(hostname, cpu_info, virt_what, meminfo, ip_addr, dmidecode,
                    redhat_release, uname, lsmod, installed_rpms, unit_files, ps_auxcww,
-                   date_utc, uptime, yum_repos_d, ls_etc, cloud_provider):
+                   date_utc, uptime, yum_repos_d, ls_etc, cloud_provider, display_name):
     """
     This method applies parsers to a host and returns a system profile that can
     be sent to inventory service.
@@ -129,6 +133,9 @@ def system_profile(hostname, cpu_info, virt_what, meminfo, ip_addr, dmidecode,
     if cloud_provider:
         profile['cloud_provider'] = cloud_provider.cloud_provider
 
+    if display_name:
+        profile['display_name'] = display_name.content[0]
+
     metadata_response = make_metadata()
     profile_sans_none = _remove_empties(profile)
     metadata_response.update(profile_sans_none)
@@ -208,24 +215,26 @@ def get_system_profile(path=None):
     return result
 
 
-def extract_facts(archive, request_id, account, remove=True):
+@mnm.extract_facts_time.time()
+def extract_facts(data, request_id, account, extra, remove=True):
     # TODO: facts, system_profiles, and errors are all passed through via the
     # 'facts' hash. These should likely be split out.
-    logger.info("extracting facts from %s", archive, extra={"request_id": request_id,
-                                                            "account": account})
     facts = {}
     try:
-        with extract(archive) as ex:
-            facts = get_canonical_facts(path=ex.tmp_dir)
-            facts['system_profile'] = get_system_profile(path=ex.tmp_dir)
+        with NamedTemporaryFile(delete=remove) as tf:
+            tf.write(data)
+            data = None
+            logger.info("extracting facts from %s", tf.name, extra=extra)
+            with extract(tf.name) as ex:
+                facts = get_canonical_facts(path=ex.tmp_dir)
+                facts['system_profile'] = get_system_profile(path=ex.tmp_dir)
     except Exception as e:
-        logger.exception("Failed to extract facts: %s", e, extra={"request_id": request_id,
-                                                                  "account": account})
+        logger.exception("Failed to extract facts: %s", e, extra=extra)
         facts['error'] = e
-
-    groomed_facts = _remove_empties(_remove_bad_display_name(facts))
-    if remove:
-        os.remove(archive)
-    logger.info("Successfully extracted canonical facts", extra={"request_id": request_id,
-                                                                 "account": account})
-    return groomed_facts
+    else:
+        logger.info("Successfully extracted canonical facts", extra=extra)
+    finally:
+        if facts['system_profile'].get('display_name'):
+            facts['display_name'] = facts['system_profile'].get('display_name')
+        groomed_facts = _remove_empties(_remove_bad_display_name(facts))
+        return groomed_facts
